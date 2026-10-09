@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Token Hunter</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:#0d0f1a;color:#e8eaff;font-family:system-ui,sans-serif;user-select:none;touch-action:none}
+  h1{margin:0;font-size:22px;letter-spacing:3px;color:#7cf5c4}
+  #slots{display:flex;gap:6px;flex-wrap:wrap;justify-content:center;max-width:480px}
+  .slot{width:34px;height:42px;border:2px solid #2c3258;border-radius:6px;display:flex;align-items:center;justify-content:center;font:bold 20px monospace;color:#7cf5c4;background:#141830}
+  .slot.on{border-color:#7cf5c4;box-shadow:0 0 10px #7cf5c466}
+  canvas{width:min(92vw,480px);height:min(92vw,480px);background:#10142a;border:2px solid #2c3258;border-radius:10px}
+  #hint{font-size:13px;color:#8a90c0;text-align:center;padding:0 12px}
+  #yt{position:fixed;inset:0;width:100vw;height:100vh;opacity:0;pointer-events:none;z-index:-1;background:#000}
+  #yt.show{opacity:1;pointer-events:auto;z-index:99}
+  #yt iframe{width:100%;height:100%;border:0}
+  #mute{position:fixed;top:10px;right:10px;background:#141830;border:2px solid #2c3258;color:#e8eaff;border-radius:8px;font-size:18px;padding:4px 9px;cursor:pointer}
+</style>
+</head>
+<body>
+<button id="mute" title="Audio (M)">🔊</button>
+<h1>TOKEN HUNTER</h1>
+<div id="slots"></div>
+<canvas id="c" width="480" height="480"></canvas>
+<div id="hint">Frecce / WASD o trascina il dito per muoverti. Raccogli i token in ordine per ricostruire la chiave. Evita i quadrati rossi!</div>
+<div id="yt"><div id="ytp"></div></div>
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+const KEY = ["d","Q","w","4","w","9","W","g","X","c","Q"];
+const slotsEl = document.getElementById("slots");
+KEY.forEach(()=>{const s=document.createElement("div");s.className="slot";s.textContent="?";slotsEl.appendChild(s)});
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const W = 480;
+const p = {x:W/2,y:W/2,r:12,speed:3.2};
+let idx = 0, token = null, hurt = 0, done = false;
+// ---- audio procedurale arcade (WebAudio, nessun file esterno) ----
+let AC=null, muted=false;
+function ac(){
+  if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)()}catch(e){return null}}
+  if(AC.state==="suspended")AC.resume();
+  return AC;
+}
+function tone(f,t0,dur,type="square",vol=0.12,slideTo=null){
+  const a=ac();if(!a||muted)return;
+  const o=a.createOscillator(),g=a.createGain(),t=a.currentTime+t0;
+  o.type=type;o.frequency.setValueAtTime(f,t);
+  if(slideTo)o.frequency.exponentialRampToValueAtTime(slideTo,t+dur);
+  g.gain.setValueAtTime(vol,t);
+  g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  o.connect(g).connect(a.destination);o.start(t);o.stop(t+dur+0.02);
+}
+function noise(t0,dur,vol=0.15){
+  const a=ac();if(!a||muted)return;
+  const n=Math.floor(a.sampleRate*dur),b=a.createBuffer(1,n,a.sampleRate),d=b.getChannelData(0);
+  for(let i=0;i<n;i++)d[i]=(Math.random()*2-1)*(1-i/n);
+  const src=a.createBufferSource(),g=a.createGain(),t=a.currentTime+t0;
+  src.buffer=b;g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  src.connect(g).connect(a.destination);src.start(t);
+}
+// scala pentatonica: ogni token sale di tono
+const SCALE=[0,2,4,7,9,12,14,16,19,21,24];
+const sfx={
+  start(){[523,659,784].forEach((f,i)=>tone(f,i*.07,.1,"square",.09))},
+  collect(i){
+    const f=392*Math.pow(2,SCALE[Math.min(i,SCALE.length-1)]/12);
+    tone(f,0,.07,"square",.1);tone(f*2,.06,.12,"square",.1);
+  },
+  hit(){tone(220,0,.25,"sawtooth",.14,45);noise(0,.2,.18)},
+  win(){tone(1568,0,.05,"square",.08)}
+};
+// al primo input sblocca l'audio, M per silenziare
+const btn=document.getElementById('mute');
+btn.addEventListener('pointerdown',e=>{e.stopPropagation();muted=!muted;btn.textContent=muted?'🔇':'🔊'});
+btn.addEventListener('click',e=>e.stopPropagation());
+let started=false;
+function firstAudio(){if(started)return;started=true;ac();sfx.start()}
+["keydown","pointerdown"].forEach(ev=>addEventListener(ev,firstAudio,{passive:true}));
+addEventListener("keydown",e=>{if(e.key.toLowerCase()==="m"){muted=!muted;btn.textContent=muted?"🔇":"🔊"}});
+
+const keys = {}; let target = null;
+const enemies = Array.from({length:4},()=>({x:Math.random()*W,y:Math.random()*W,vx:(Math.random()<.5?-1:1)*(1.2+Math.random()),vy:(Math.random()<.5?-1:1)*(1.2+Math.random()),s:22}));
+
+function spawn(){
+  let x,y;
+  do { x=30+Math.random()*(W-60); y=30+Math.random()*(W-60); } while(Math.hypot(x-p.x,y-p.y)<120);
+  token = {x,y,r:16};
+}
+spawn();
+
+addEventListener("keydown",e=>{keys[e.key.toLowerCase()]=true;if(e.key.startsWith("Arrow"))e.preventDefault()});
+addEventListener("keyup",e=>keys[e.key.toLowerCase()]=false);
+function pt(e){const r=cv.getBoundingClientRect();const t=e.touches?e.touches[0]:e;return {x:(t.clientX-r.left)*W/r.width,y:(t.clientY-r.top)*W/r.height}}
+["pointerdown","pointermove"].forEach(ev=>cv.addEventListener(ev,e=>{if(ev==="pointermove"&&e.buttons===0&&e.pointerType==="mouse")return;target=pt(e)}));
+["pointerup","pointercancel"].forEach(ev=>addEventListener(ev,()=>target=null));
+
+function refreshSlots(){
+  [...slotsEl.children].forEach((s,i)=>{const on=i<idx;s.classList.toggle("on",on);s.textContent=on?KEY[i]:"?"});
+}
+
+let yt=null, ytReady=false, ytFailed=false, primed=false;
+function onYouTubeIframeAPIReady(){
+  yt=new YT.Player("ytp",{
+    width:"100%",height:"100%",videoId:KEY.join(""),
+    playerVars:{autoplay:0,controls:0,rel:0,playsinline:1,modestbranding:1,iv_load_policy:3},
+    events:{
+      onReady:()=>{ytReady=true;yt.mute()},
+      onError:()=>{ytFailed=true}
+    }
+  });
+}
+// al primo input: avvia il video muto e nascosto, cosi' si carica/bufferizza
+function prime(){
+  if(primed||!ytReady)return;
+  primed=true;
+  try{yt.mute();yt.playVideo()}catch(e){ytFailed=true}
+}
+["keydown","pointerdown"].forEach(ev=>addEventListener(ev,prime,{passive:true}));
+
+function fallback(){location.href="https://www.youtube.com/watch?v="+KEY.join("")+"&autoplay=1"}
+function win(){
+  done=true;
+  setTimeout(()=>{try{AC&&AC.suspend()}catch(e){}},400);
+  if(!ytReady||ytFailed){fallback();return}
+  document.getElementById("yt").classList.add("show");
+  document.body.style.overflow="hidden";
+  try{
+    yt.seekTo(0,true);yt.unMute();yt.setVolume(100);yt.playVideo();
+  }catch(e){fallback();return}
+  // se dopo 2s non sta partendo, ripiega sul redirect
+  setTimeout(()=>{try{if(yt.getPlayerState()!==1)fallback()}catch(e){fallback()}},2000);
+}
+
+function step(){
+  if(done) return;
+  let dx=0,dy=0;
+  if(keys["arrowleft"]||keys["a"])dx-=1;
+  if(keys["arrowright"]||keys["d"])dx+=1;
+  if(keys["arrowup"]||keys["w"])dy-=1;
+  if(keys["arrowdown"]||keys["s"])dy+=1;
+  if(target&&!dx&&!dy){const d=Math.hypot(target.x-p.x,target.y-p.y);if(d>6){dx=(target.x-p.x)/d;dy=(target.y-p.y)/d}}
+  const m=Math.hypot(dx,dy)||1;
+  p.x=Math.max(p.r,Math.min(W-p.r,p.x+dx/m*p.speed*(dx||dy?1:0)));
+  p.y=Math.max(p.r,Math.min(W-p.r,p.y+dy/m*p.speed*(dx||dy?1:0)));
+
+  enemies.forEach(e=>{
+    e.x+=e.vx;e.y+=e.vy;
+    if(e.x<0||e.x>W-e.s)e.vx*=-1;
+    if(e.y<0||e.y>W-e.s)e.vy*=-1;
+    if(hurt<=0 && p.x>e.x-p.r&&p.x<e.x+e.s+p.r&&p.y>e.y-p.r&&p.y<e.y+e.s+p.r){
+      hurt=90; sfx.hit(); if(idx>0){idx--;refreshSlots();} p.x=W/2;p.y=W/2;
+    }
+  });
+  if(hurt>0)hurt--;
+
+  if(Math.hypot(token.x-p.x,token.y-p.y)<token.r+p.r){
+    sfx.collect(idx);idx++; refreshSlots();
+    if(idx===KEY.length){win();return}
+    spawn();
+  }
+}
+
+function draw(t){
+  ctx.clearRect(0,0,W,W);
+  ctx.strokeStyle="#1a2040";ctx.lineWidth=1;
+  for(let i=0;i<W;i+=40){ctx.beginPath();ctx.moveTo(i,0);ctx.lineTo(i,W);ctx.stroke();ctx.beginPath();ctx.moveTo(0,i);ctx.lineTo(W,i);ctx.stroke()}
+  enemies.forEach(e=>{ctx.fillStyle="#ff4d6d";ctx.fillRect(e.x,e.y,e.s,e.s)});
+  if(token){
+    const pulse=1+Math.sin(t/180)*.12;
+    ctx.save();ctx.translate(token.x,token.y);ctx.scale(pulse,pulse);
+    ctx.shadowColor="#ffd84d";ctx.shadowBlur=18;
+    ctx.fillStyle="#ffd84d";ctx.beginPath();ctx.arc(0,0,token.r,0,7);ctx.fill();
+    ctx.shadowBlur=0;ctx.fillStyle="#7a5b00";ctx.font="bold 16px monospace";ctx.textAlign="center";ctx.textBaseline="middle";
+    ctx.fillText(idx+1,0,1);ctx.restore();
+  }
+  if(!(hurt>0&&Math.floor(hurt/6)%2)){
+    ctx.fillStyle="#7cf5c4";ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,7);ctx.fill();
+  }
+  ctx.fillStyle="#8a90c0";ctx.font="13px monospace";ctx.textAlign="left";ctx.fillText(`Token ${idx}/${KEY.length}`,10,20);
+}
+function loop(t){step();draw(t);if(!done)requestAnimationFrame(loop)}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
